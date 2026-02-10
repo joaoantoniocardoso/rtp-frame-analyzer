@@ -254,19 +254,23 @@ def generate_html(run_dir: str) -> str:
 </div>
 """
 
-    # Key finding alert
+    # Summary highlight (neutral, data-only)
     i_median = s("I_interval_median_ms")
     i_delivery = s("I_delivery_mean_ms")
+    p_median = s("P_interval_median_ms")
     nominal = s("nominal_interval_ms", 33.33)
     if isinstance(i_median, (int, float)) and isinstance(nominal, (int, float)):
-        ratio = i_median / nominal
+        i_ratio = i_median / nominal
         html += f"""
-<div class="alert alert-danger">
-  <strong>Key Finding:</strong> I-frame inter-arrival interval is <strong>{i_median:.1f}ms</strong>
-  (median), which is <strong>{ratio:.1f}x</strong> the nominal frame period of {nominal:.1f}ms.
-  The camera takes an average of <strong>{i_delivery:.1f}ms</strong> just to transmit all RTP
-  packets for a single I-frame. This was measured at the raw UDP packet level on the receiving
-  host &mdash; no video processing pipeline is involved.
+<div class="alert alert-info">
+  <strong>Measurement summary:</strong> Over this capture, the median inter-frame arrival
+  interval was <strong>{i_median:.1f}ms</strong> for I-frames
+  ({i_ratio:.1f}x the {nominal:.1f}ms nominal period) and
+  <strong>{p_median:.1f}ms</strong> for P-frames.
+  The mean time to deliver all RTP packets of a single I-frame was
+  <strong>{i_delivery:.1f}ms</strong>.
+  These values were measured at the raw UDP packet level before any
+  video processing pipeline.
 </div>
 """
 
@@ -367,13 +371,13 @@ larger than P-frames. A threshold of 3x the median frame size is used.</p>
     html += "\n<h2>3. Analysis Plots</h2>\n"
 
     plot_descriptions = {
-        "01_timeseries": "Inter-frame arrival interval over time. Each point is one frame. I-frames (red diamonds) consistently show intervals far exceeding the nominal frame period, indicating the camera stalls video delivery while transmitting large I-frames.",
-        "02_distributions": "Distribution of inter-frame intervals for I-frames and P-frames separately. P-frames cluster tightly around the nominal period, while I-frames show a completely separate, much higher distribution.",
-        "03_scatter": "Frame size vs inter-frame arrival interval. Shows the strong correlation between frame size and delivery delay - larger I-frames take proportionally longer to deliver.",
-        "04_delivery_duration": "Time from first to last RTP packet for each frame. This measures how long the camera's RTP packetizer takes to transmit all fragments of a single frame. I-frames require significantly more transmission time.",
-        "05_cumulative_excess": "Running total of excess latency (interval beyond nominal). Each step corresponds to a late frame. The steep jumps align with I-frame positions (red vertical lines), confirming I-frames are the dominant source of accumulated delay.",
-        "06_jitter": "Delivery jitter (actual interval minus expected interval from RTP timestamps). Positive jitter means the frame arrived later than expected. I-frames consistently show large positive jitter.",
-        "07_size_vs_delivery": "Frame size vs delivery duration with linear regression. The linear relationship confirms that delivery time scales with frame size, suggesting the camera's network interface is bandwidth-limited.",
+        "01_timeseries": "Inter-frame arrival interval over time. Each point represents one frame. I-frames are shown as red diamonds, P-frames as blue dots. The green dashed line marks the nominal frame period.",
+        "02_distributions": "Distribution of inter-frame intervals, shown separately for I-frames and P-frames. Vertical lines mark the median and 95th percentile for each distribution.",
+        "03_scatter": "Frame size (KB) plotted against inter-frame arrival interval (ms). This visualizes whether there is a relationship between frame size and delivery timing.",
+        "04_delivery_duration": "Time elapsed from the first to the last RTP packet within each frame. This measures how long it takes to receive all RTP fragments of a single frame.",
+        "05_cumulative_excess": "Running sum of excess latency (any interval beyond the nominal frame period). Red vertical lines mark I-frame positions. Steeper slopes indicate periods of higher accumulated delay.",
+        "06_jitter": "Delivery jitter, defined as the difference between the measured wall-clock interval and the expected interval derived from RTP timestamps. Zero means the frame arrived exactly when expected.",
+        "07_size_vs_delivery": "Frame size plotted against delivery duration (first-to-last RTP packet), with a linear regression fit. This shows whether delivery time scales with frame size.",
     }
 
     for plot in plots:
@@ -386,33 +390,81 @@ larger than P-frames. A threshold of 3x the median frame size is used.</p>
 </div>
 """
 
-    # Interpretation
-    html += """
-<h2>4. Interpretation</h2>
-<div class="alert alert-info">
-  <strong>Conclusion:</strong> The I-frame delivery latency is a property of the camera's
-  encoder/packetizer and network interface, NOT the receiving host's processing pipeline.
-  This was measured using raw UDP packet capture (tcpdump) on a host with no video processing
-  overhead. The camera cannot transmit I-frame data fast enough within a single frame period,
-  causing a visible stall/freeze every time an I-frame is sent.
+    # Observations (neutral, data-driven)
+    html += "\n<h2>4. Observations</h2>\n"
+    html += """<div class="methodology">
+<p>The following observations are derived from the measured data. They describe what was
+observed during this specific capture and may not generalize to other configurations,
+network conditions, or hardware.</p>
+<ul>
+"""
+    # Build observations dynamically from the data
+    observations = []
+    if isinstance(i_median, (int, float)) and isinstance(nominal, (int, float)):
+        observations.append(
+            f"I-frame inter-arrival intervals (median {i_median:.1f}ms) were "
+            f"{'above' if i_median > nominal else 'at or below'} the nominal "
+            f"frame period ({nominal:.1f}ms)."
+        )
+    if isinstance(s("I_delivery_mean_ms"), (int, float)):
+        observations.append(
+            f"The mean time to deliver all RTP packets of a single I-frame was "
+            f"{s('I_delivery_mean_ms'):.1f}ms (max {s('I_delivery_max_ms'):.1f}ms)."
+        )
+    if isinstance(p_median, (int, float)) and isinstance(nominal, (int, float)):
+        observations.append(
+            f"P-frame inter-arrival intervals (median {p_median:.1f}ms) were "
+            f"{'close to' if abs(p_median - nominal) < nominal * 0.15 else 'different from'} "
+            f"the nominal frame period."
+        )
+    if isinstance(s("I_size_mean_bytes"), (int, float)) and isinstance(s("P_size_mean_bytes"), (int, float)):
+        ratio = s("I_size_mean_bytes") / max(1, s("P_size_mean_bytes"))
+        observations.append(
+            f"I-frames were on average {ratio:.1f}x larger than P-frames "
+            f"({s('I_size_mean_bytes')/1024:.0f} KB vs {s('P_size_mean_bytes')/1024:.0f} KB)."
+        )
+    if "regression_slope_ms_per_kb" in stats:
+        observations.append(
+            f"A linear regression of frame size vs delivery duration yielded a slope of "
+            f"{stats['regression_slope_ms_per_kb']:.3f} ms/KB "
+            f"(intercept {stats['regression_intercept_ms']:.1f}ms)."
+        )
+    if isinstance(s("stall_count"), (int, float)):
+        observations.append(
+            f"{int(s('stall_count'))} frames ({s('stall_pct'):.2f}%) exceeded "
+            f"the stall threshold of {s('stall_threshold_ms'):.1f}ms."
+        )
+    if isinstance(s("cumulative_excess_ms"), (int, float)):
+        observations.append(
+            f"The cumulative excess latency over the capture was "
+            f"{s('cumulative_excess_ms'):.1f}ms."
+        )
+
+    for obs in observations:
+        html += f"  <li>{obs}</li>\n"
+
+    html += """</ul>
 </div>
 
-<h3>Root Cause</h3>
-<p>At the current configuration, I-frames are significantly larger than P-frames. The camera's
-RTP packetizer transmits these large frames sequentially over its network interface. Because the
-total I-frame transmission time exceeds the frame period, the next frame's delivery is delayed,
-creating a visible stall in the video stream.</p>
-
-<h3>Potential Mitigations</h3>
+<h3>How to Read This Report</h3>
+<div class="methodology">
+<p>This report presents raw measurements taken at the network packet level. It captures
+what <em>actually happened</em> on the wire during the test window. Consider the following
+when interpreting the results:</p>
 <ul>
-  <li><strong>Reduce I-frame size:</strong> Lower the bitrate, resolution, or quality to reduce I-frame size.</li>
-  <li><strong>Increase GOP:</strong> Fewer I-frames means fewer stalls (but longer recovery from packet loss).</li>
-  <li><strong>Camera firmware improvement:</strong> The encoder could spread I-frame RTP packets
-      over a longer time window, interleaving with the previous frame period, rather than bursting
-      them all at once after encoding completes.</li>
-  <li><strong>Receiver-side buffering:</strong> Adding a jitter buffer (e.g., 100-150ms) would
-      smooth out the stalls at the cost of added latency.</li>
+  <li><strong>Scope:</strong> These measurements reflect the combined behavior of the camera
+      encoder, its RTP packetizer, and the network path. They do not include any
+      receiver-side video processing overhead.</li>
+  <li><strong>Reproducibility:</strong> Results may vary with different encoder settings
+      (bitrate, GOP, resolution, profile), network conditions, or camera firmware versions.</li>
+  <li><strong>Frame classification:</strong> I-frames and P-frames are identified by a size
+      heuristic (threshold = 3&times; median frame size). This is generally reliable for
+      H.264 but should be verified if results seem unexpected.</li>
+  <li><strong>Raw data:</strong> The <code>stats.json</code>, <code>frame_log.jsonl</code>,
+      and <code>capture.pcap</code> files are included alongside this report for independent
+      verification and further analysis.</li>
 </ul>
+</div>
 """
 
     # Footer
