@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY entrypoint.sh analyze.py report.py collect_metadata.py ./
+COPY entrypoint.sh analyze.py report.py collect_metadata.py camera_monitor.py ./
 RUN chmod +x entrypoint.sh
 
 # Default configuration via environment variables

@@ -290,6 +290,26 @@ def _parse_snapshot(path: str) -> dict | None:
             except ValueError:
                 continue
 
+    # Thermal zones (millidegrees -> degrees C)
+    temps = []
+    in_thermal = False
+    for line in text.splitlines():
+        if line.startswith("--- thermal"):
+            in_thermal = True
+            continue
+        if line.startswith("---"):
+            if in_thermal:
+                break
+            continue
+        if in_thermal and ":" in line:
+            try:
+                _, raw = line.split(":", 1)
+                temps.append(int(raw.strip()) / 1000.0)
+            except (ValueError, IndexError):
+                continue
+    if temps:
+        snap["temp_c"] = max(temps)  # use the hottest zone
+
     return snap if "ts" in snap else None
 
 
@@ -346,7 +366,13 @@ def parse_sysmon(sysmon_dir: str) -> dict:
     if "loadavg_1" in end:
         result["loadavg_end"] = [end.get("loadavg_1"), end.get("loadavg_5"), end.get("loadavg_15")]
 
-    # Per-sample CPU timeseries for plotting
+    # Temperature at start / end
+    if "temp_c" in start:
+        result["temp_start_c"] = start["temp_c"]
+    if "temp_c" in end:
+        result["temp_end_c"] = end["temp_c"]
+
+    # Per-sample CPU + temperature + memory timeseries for plotting
     samples = sorted(sd.glob("sample_*.txt"))
     if len(samples) >= 2:
         cpu_ts = []
@@ -357,12 +383,168 @@ def parse_sysmon(sysmon_dir: str) -> dict:
                 dt = curr_snap["cpu_total"] - prev_snap["cpu_total"]
                 db = curr_snap["cpu_busy"] - prev_snap["cpu_busy"]
                 if dt > 0:
-                    cpu_ts.append({
+                    entry: dict = {
                         "t": curr_snap.get("ts", 0) - start.get("ts", 0),
                         "cpu_pct": round(db / dt * 100, 1),
-                    })
+                    }
+                    if "temp_c" in curr_snap:
+                        entry["temp_c"] = round(curr_snap["temp_c"], 1)
+                    # Memory usage
+                    mem_total = curr_snap.get("mem_memtotal_kb", 0)
+                    mem_avail = curr_snap.get("mem_memavailable_kb")
+                    if mem_total > 0 and mem_avail is not None:
+                        entry["mem_pct"] = round(
+                            (mem_total - mem_avail) / mem_total * 100, 1
+                        )
+                    cpu_ts.append(entry)
             prev_snap = curr_snap
         result["cpu_timeseries"] = cpu_ts
+
+        # Temperature aggregate stats from samples
+        all_temps = [s["temp_c"] for s in
+                     [_parse_snapshot(str(sp)) for sp in samples]
+                     if s and "temp_c" in s]
+        if all_temps:
+            result["temp_min_c"] = round(min(all_temps), 1)
+            result["temp_max_c"] = round(max(all_temps), 1)
+            result["temp_mean_c"] = round(sum(all_temps) / len(all_temps), 1)
+
+    return result
+
+
+def parse_camera_monitor(ndjson_path: str, rtsp_start_ts: float | None = None) -> dict:
+    """
+    Parse camera SoC monitor NDJSON file.
+
+    If rtsp_start_ts is provided, samples before it are classified as
+    'baseline' and after as 'streaming'.  Otherwise all samples are 'streaming'.
+    """
+    samples = []
+    with open(ndjson_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                samples.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    if not samples:
+        return {}
+
+    result: dict = {"sample_count": len(samples)}
+
+    # Classify samples into baseline vs streaming
+    if rtsp_start_ts is not None:
+        baseline = [s for s in samples if s["ts"] < rtsp_start_ts]
+        streaming = [s for s in samples if s["ts"] >= rtsp_start_ts]
+    else:
+        baseline = []
+        streaming = samples
+
+    result["baseline_samples"] = len(baseline)
+    result["streaming_samples"] = len(streaming)
+
+    def _stats(sample_list, prefix):
+        """Compute aggregate stats for a list of samples."""
+        if not sample_list:
+            return {}
+        out = {}
+        # Temperature
+        temps = [s["temp_c"] for s in sample_list if "temp_c" in s]
+        if temps:
+            out[f"{prefix}_temp_mean_c"] = round(float(np.mean(temps)), 1)
+            out[f"{prefix}_temp_min_c"] = round(float(np.min(temps)), 1)
+            out[f"{prefix}_temp_max_c"] = round(float(np.max(temps)), 1)
+
+        # CPU usage from /proc/stat deltas
+        cpu_pcts = []
+        for i in range(1, len(sample_list)):
+            prev, curr = sample_list[i - 1], sample_list[i]
+            if "cpu_total" in prev and "cpu_total" in curr:
+                dt = curr["cpu_total"] - prev["cpu_total"]
+                db = curr["cpu_busy"] - prev["cpu_busy"]
+                if dt > 0:
+                    cpu_pcts.append(round(db / dt * 100, 1))
+        if cpu_pcts:
+            out[f"{prefix}_cpu_mean_pct"] = round(float(np.mean(cpu_pcts)), 1)
+            out[f"{prefix}_cpu_min_pct"] = round(float(np.min(cpu_pcts)), 1)
+            out[f"{prefix}_cpu_max_pct"] = round(float(np.max(cpu_pcts)), 1)
+
+        # Memory usage
+        mem_used_pcts = []
+        for s in sample_list:
+            total = s.get("mem_memtotal_kb", 0)
+            avail = s.get("mem_memavailable_kb")
+            free = s.get("mem_memfree_kb")
+            if total > 0:
+                if avail is not None:
+                    used_pct = (total - avail) / total * 100
+                elif free is not None:
+                    used_pct = (total - free) / total * 100
+                else:
+                    continue
+                mem_used_pcts.append(round(used_pct, 1))
+        if mem_used_pcts:
+            out[f"{prefix}_mem_mean_pct"] = round(float(np.mean(mem_used_pcts)), 1)
+            out[f"{prefix}_mem_min_pct"] = round(float(np.min(mem_used_pcts)), 1)
+            out[f"{prefix}_mem_max_pct"] = round(float(np.max(mem_used_pcts)), 1)
+            # Also store absolute values from the last sample
+            last = sample_list[-1]
+            out[f"{prefix}_mem_total_kb"] = last.get("mem_memtotal_kb", 0)
+            out[f"{prefix}_mem_free_kb"] = last.get("mem_memfree_kb", 0)
+            out[f"{prefix}_mem_available_kb"] = last.get("mem_memavailable_kb", 0)
+
+        # Voltages (from last sample)
+        last = sample_list[-1]
+        for vkey in ("core_volt", "cpu_volt", "npu_volt"):
+            if vkey in last:
+                out[f"{prefix}_{vkey}_mv"] = last[vkey]
+
+        return out
+
+    result.update(_stats(baseline, "baseline"))
+    result.update(_stats(streaming, "streaming"))
+    result.update(_stats(samples, "overall"))
+
+    # Build timeseries for plotting (relative to first sample)
+    t0 = samples[0]["ts"]
+    timeseries = []
+    for i in range(1, len(samples)):
+        prev, curr = samples[i - 1], samples[i]
+        entry: dict = {"t": round(curr["ts"] - t0, 2)}
+
+        if "temp_c" in curr:
+            entry["temp_c"] = curr["temp_c"]
+
+        if "cpu_total" in prev and "cpu_total" in curr:
+            dt = curr["cpu_total"] - prev["cpu_total"]
+            db = curr["cpu_busy"] - prev["cpu_busy"]
+            if dt > 0:
+                entry["cpu_pct"] = round(db / dt * 100, 1)
+
+        total = curr.get("mem_memtotal_kb", 0)
+        avail = curr.get("mem_memavailable_kb")
+        free = curr.get("mem_memfree_kb")
+        if total > 0:
+            if avail is not None:
+                entry["mem_pct"] = round((total - avail) / total * 100, 1)
+            elif free is not None:
+                entry["mem_pct"] = round((total - free) / total * 100, 1)
+
+        for vkey in ("core_volt", "cpu_volt", "npu_volt"):
+            if vkey in curr:
+                entry[vkey] = curr[vkey]
+
+        entry["is_baseline"] = curr["ts"] < rtsp_start_ts if rtsp_start_ts else False
+        timeseries.append(entry)
+
+    result["timeseries"] = timeseries
+
+    # Mark the RTSP start time relative to t0
+    if rtsp_start_ts is not None:
+        result["rtsp_start_offset_s"] = round(rtsp_start_ts - t0, 2)
 
     return result
 
@@ -526,6 +708,133 @@ def generate_plots(frames: list[dict], stats: dict, out_dir: str):
     fig.savefig(out / "07_size_vs_delivery.png", dpi=150)
     plt.close(fig)
 
+    # ---- 8. Host system monitoring (CPU, Memory, Temperature) ----
+    host_ts = stats.get("system_metrics", {}).get("cpu_timeseries", [])
+    if len(host_ts) >= 2:
+        ht_times = [e["t"] for e in host_ts]
+        ht_cpu = [e.get("cpu_pct") for e in host_ts]
+        ht_mem = [e.get("mem_pct") for e in host_ts]
+        ht_temp = [e.get("temp_c") for e in host_ts]
+
+        has_cpu = any(v is not None for v in ht_cpu)
+        has_mem = any(v is not None for v in ht_mem)
+        has_temp = any(v is not None for v in ht_temp)
+        n_axes = sum([has_cpu or has_mem, has_temp])
+
+        if n_axes > 0:
+            fig, axes_arr = plt.subplots(n_axes, 1, figsize=(14, 3.5 * n_axes),
+                                         sharex=True, squeeze=False)
+            axes_flat = axes_arr.flatten()
+            ax_idx = 0
+
+            # CPU + Memory subplot
+            if has_cpu or has_mem:
+                ax = axes_flat[ax_idx]
+                ax.set_facecolor(CBG)
+                if has_cpu:
+                    valid = [(t, v) for t, v in zip(ht_times, ht_cpu) if v is not None]
+                    if valid:
+                        ax.plot([t for t, _ in valid], [v for _, v in valid],
+                                color="#e74c3c", lw=1.5, marker=".", ms=4, label="CPU %")
+                if has_mem:
+                    valid = [(t, v) for t, v in zip(ht_times, ht_mem) if v is not None]
+                    if valid:
+                        ax.plot([t for t, _ in valid], [v for _, v in valid],
+                                color="#3498db", lw=1.5, marker="s", ms=3, label="Memory %")
+                ax.set_ylabel("Usage (%)")
+                ax.set_ylim(0, 105)
+                ax.set_title("Host System — CPU & Memory Usage During Capture")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.grid(True, alpha=0.3)
+                ax_idx += 1
+
+            # Temperature subplot
+            if has_temp:
+                ax = axes_flat[ax_idx]
+                ax.set_facecolor(CBG)
+                valid = [(t, v) for t, v in zip(ht_times, ht_temp) if v is not None]
+                if valid:
+                    ax.plot([t for t, _ in valid], [v for _, v in valid],
+                            color="#e67e22", lw=1.5, marker="^", ms=4, label="Temperature")
+                ax.set_ylabel("Temperature (°C)")
+                ax.set_title("Host System — Temperature During Capture")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.grid(True, alpha=0.3)
+
+            axes_flat[-1].set_xlabel("Time (s)")
+            fig.tight_layout()
+            fig.savefig(out / "08_host_system.png", dpi=150)
+            plt.close(fig)
+
+    # ---- 9. Camera SoC monitoring (CPU, Memory, Temperature) ----
+    cam_ts = stats.get("camera_soc", {}).get("timeseries", [])
+    rtsp_offset = stats.get("camera_soc", {}).get("rtsp_start_offset_s")
+    if len(cam_ts) >= 2:
+        ct_times = [e["t"] for e in cam_ts]
+        ct_cpu = [e.get("cpu_pct") for e in cam_ts]
+        ct_mem = [e.get("mem_pct") for e in cam_ts]
+        ct_temp = [e.get("temp_c") for e in cam_ts]
+        ct_baseline = [e.get("is_baseline", False) for e in cam_ts]
+
+        has_cpu = any(v is not None for v in ct_cpu)
+        has_mem = any(v is not None for v in ct_mem)
+        has_temp = any(v is not None for v in ct_temp)
+
+        n_axes = sum([has_cpu or has_mem, has_temp])
+        if n_axes > 0:
+            fig, axes_arr = plt.subplots(n_axes, 1, figsize=(14, 3.5 * n_axes),
+                                         sharex=True, squeeze=False)
+            axes_flat = axes_arr.flatten()
+            ax_idx = 0
+
+            def _add_baseline_region(ax_obj):
+                """Shade the baseline region."""
+                if rtsp_offset is not None and rtsp_offset > 0:
+                    ax_obj.axvspan(0, rtsp_offset, alpha=0.10, color="gray",
+                                   label="Baseline (no stream)")
+                    ax_obj.axvline(rtsp_offset, color="gray", ls=":", alpha=0.6, lw=1)
+
+            # CPU + Memory subplot
+            if has_cpu or has_mem:
+                ax = axes_flat[ax_idx]
+                ax.set_facecolor(CBG)
+                _add_baseline_region(ax)
+                if has_cpu:
+                    valid = [(t, v) for t, v in zip(ct_times, ct_cpu) if v is not None]
+                    if valid:
+                        ax.plot([t for t, _ in valid], [v for _, v in valid],
+                                color="#e74c3c", lw=1.5, marker=".", ms=4, label="CPU %")
+                if has_mem:
+                    valid = [(t, v) for t, v in zip(ct_times, ct_mem) if v is not None]
+                    if valid:
+                        ax.plot([t for t, _ in valid], [v for _, v in valid],
+                                color="#3498db", lw=1.5, marker="s", ms=3, label="Memory %")
+                ax.set_ylabel("Usage (%)")
+                ax.set_ylim(0, 105)
+                ax.set_title("Camera SoC — CPU & Memory Usage (baseline → streaming)")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.grid(True, alpha=0.3)
+                ax_idx += 1
+
+            # Temperature subplot
+            if has_temp:
+                ax = axes_flat[ax_idx]
+                ax.set_facecolor(CBG)
+                _add_baseline_region(ax)
+                valid = [(t, v) for t, v in zip(ct_times, ct_temp) if v is not None]
+                if valid:
+                    ax.plot([t for t, _ in valid], [v for _, v in valid],
+                            color="#e67e22", lw=1.5, marker="^", ms=4, label="Temperature")
+                ax.set_ylabel("Temperature (°C)")
+                ax.set_title("Camera SoC — Temperature (baseline → streaming)")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.grid(True, alpha=0.3)
+
+            axes_flat[-1].set_xlabel("Time (s)")
+            fig.tight_layout()
+            fig.savefig(out / "09_camera_soc.png", dpi=150)
+            plt.close(fig)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -537,6 +846,8 @@ def main():
     parser.add_argument("--output-dir", default=None, help="Output directory")
     parser.add_argument("--metadata", default=None, help="Path to run metadata JSON")
     parser.add_argument("--sysmon-dir", default=None, help="Path to sysmon snapshot directory")
+    parser.add_argument("--camera-info", default=None, help="Path to camera_info.json (RadCam API data)")
+    parser.add_argument("--camera-monitor", default=None, help="Path to camera_monitor NDJSON file")
     args = parser.parse_args()
 
     out_dir = args.output_dir or str(Path(args.csv_file).parent / "analysis")
@@ -575,16 +886,16 @@ def main():
     else:
         stats["system_metrics"] = {}
 
-    # Merge metadata (includes system info + camera info from collect_metadata.py)
-    if args.metadata and os.path.exists(args.metadata):
-        with open(args.metadata) as f:
-            stats["metadata"] = json.load(f)
-        # Extract camera info and store at top level for report.py
-        camera_info = stats["metadata"].get("camera", {})
+    # Camera info (RadCam API)
+    if args.camera_info and os.path.exists(args.camera_info):
+        print("  Loading camera info...")
+        with open(args.camera_info) as f:
+            camera_info = json.load(f)
         if camera_info.get("detected"):
             stats["camera_info"] = camera_info
-            venc = camera_info.get("venc_config_ch0") or {}
-            sys_cfg = camera_info.get("sys_config") or {}
+            # Print camera summary
+            venc = camera_info.get("venc_config_ch0", {}) or {}
+            sys_cfg = camera_info.get("sys_config", {}) or {}
             print(f"  Camera: {camera_info.get('type', 'Unknown')}")
             if sys_cfg.get("version"):
                 print(f"  Firmware: {sys_cfg['version']}")
@@ -603,6 +914,35 @@ def main():
             stats["camera_info"] = {"detected": False}
     else:
         stats["camera_info"] = {"detected": False}
+
+    # Camera SoC monitor data (telnet-based)
+    if args.camera_monitor and os.path.exists(args.camera_monitor):
+        print("  Parsing camera SoC monitor data...")
+        # Use the first RTP packet time as the RTSP start reference
+        rtsp_start = packets[0]["wall_time"] if packets else None
+        cam_soc = parse_camera_monitor(args.camera_monitor, rtsp_start)
+        stats["camera_soc"] = cam_soc
+        if cam_soc.get("baseline_samples", 0) > 0:
+            print(f"  Camera SoC: {cam_soc['sample_count']} samples "
+                  f"({cam_soc['baseline_samples']} baseline, "
+                  f"{cam_soc['streaming_samples']} streaming)")
+        else:
+            print(f"  Camera SoC: {cam_soc['sample_count']} samples")
+        if "overall_temp_mean_c" in cam_soc:
+            print(f"  Camera SoC temp:    {cam_soc['overall_temp_mean_c']}°C avg "
+                  f"(min={cam_soc.get('overall_temp_min_c', '?')}°C "
+                  f"max={cam_soc.get('overall_temp_max_c', '?')}°C)")
+        if "baseline_cpu_mean_pct" in cam_soc:
+            print(f"  Camera CPU (baseline):  {cam_soc['baseline_cpu_mean_pct']}%")
+        if "streaming_cpu_mean_pct" in cam_soc:
+            print(f"  Camera CPU (streaming): {cam_soc['streaming_cpu_mean_pct']}%")
+    else:
+        stats["camera_soc"] = {}
+
+    # Merge metadata if available
+    if args.metadata and os.path.exists(args.metadata):
+        with open(args.metadata) as f:
+            stats["metadata"] = json.load(f)
 
     print("  Generating plots...")
     generate_plots(frames, stats, out_dir)
@@ -643,8 +983,22 @@ def main():
               f"({bw.get('rtp_packet_rate_pps', 0)} pps)")
     if sm.get("cpu_usage_pct") is not None:
         print(f"  Host CPU usage:     {sm['cpu_usage_pct']}%")
+    if sm.get("temp_mean_c") is not None:
+        print(f"  CPU temperature:    {sm['temp_mean_c']}°C avg  "
+              f"(min={sm.get('temp_min_c', '?')}°C  max={sm.get('temp_max_c', '?')}°C)")
     if sm.get("net_rx_mbps") is not None:
         print(f"  Interface RX:       {sm['net_rx_mbps']} Mbps (total)")
+    csoc = stats.get("camera_soc", {})
+    if csoc.get("overall_temp_mean_c") is not None:
+        print(f"  Camera SoC temp:    {csoc['overall_temp_mean_c']}°C avg  "
+              f"(baseline={csoc.get('baseline_temp_mean_c', 'N/A')}°C  "
+              f"streaming={csoc.get('streaming_temp_mean_c', 'N/A')}°C)")
+    if csoc.get("baseline_cpu_mean_pct") is not None:
+        print(f"  Camera CPU:         baseline={csoc['baseline_cpu_mean_pct']}%  "
+              f"streaming={csoc.get('streaming_cpu_mean_pct', 'N/A')}%")
+    if csoc.get("baseline_mem_mean_pct") is not None:
+        print(f"  Camera memory:      baseline={csoc['baseline_mem_mean_pct']}%  "
+              f"streaming={csoc.get('streaming_mem_mean_pct', 'N/A')}%")
     print("  " + "=" * 60)
 
 

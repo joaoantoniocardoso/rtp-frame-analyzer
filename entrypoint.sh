@@ -13,6 +13,10 @@ set -euo pipefail
 : "${CAPTURE_DURATION:=60}"
 : "${OUTPUT_DIR:=/data}"
 : "${NETWORK_INTERFACE:=auto}"
+: "${CAMERA_TELNET_USER:=root}"
+: "${CAMERA_TELNET_PASSWORD:=}"
+: "${CAMERA_MONITOR_INTERVAL:=2}"
+: "${CAMERA_BASELINE_DURATION:=5}"
 
 echo "========================================"
 echo " RTP Frame Analyzer"
@@ -21,6 +25,11 @@ echo " RTSP URL:       ${RTSP_URL}"
 echo " Capture:        ${CAPTURE_DURATION}s"
 echo " Output:         ${OUTPUT_DIR}"
 echo " Interface:      ${NETWORK_INTERFACE}"
+if [ -n "${CAMERA_TELNET_PASSWORD}" ]; then
+    echo " Camera monitor: enabled (telnet, ${CAMERA_BASELINE_DURATION}s baseline)"
+else
+    echo " Camera monitor: disabled (set CAMERA_TELNET_PASSWORD to enable)"
+fi
 echo "========================================"
 
 # ---------------------------------------------------------------------------
@@ -62,6 +71,36 @@ CSV_FILE="${RUN_DIR}/rtp_packets.csv"
 echo "[2.5/6] Collecting system and camera metadata..."
 python3 /app/collect_metadata.py \
     "${CAMERA_IP}" "${CAPTURE_DURATION}" "${NETWORK_INTERFACE}" "${TIMESTAMP}" "${RUN_DIR}"
+
+# ---------------------------------------------------------------------------
+# Start camera SoC monitoring (if telnet password is provided)
+# ---------------------------------------------------------------------------
+CAM_MONITOR_PID=""
+CAM_MONITOR_FILE="${RUN_DIR}/camera_soc_monitor.ndjson"
+
+if [ -n "${CAMERA_TELNET_PASSWORD}" ]; then
+    # Total monitor duration = baseline + capture + buffer
+    CAM_MONITOR_DURATION=$(( CAMERA_BASELINE_DURATION + CAPTURE_DURATION + 10 ))
+    echo "[2.7/6] Starting camera SoC monitor (${CAMERA_BASELINE_DURATION}s baseline + ${CAPTURE_DURATION}s capture)..."
+    python3 /app/camera_monitor.py "${CAMERA_IP}" \
+        --user "${CAMERA_TELNET_USER}" \
+        --password "${CAMERA_TELNET_PASSWORD}" \
+        --output "${CAM_MONITOR_FILE}" \
+        --interval "${CAMERA_MONITOR_INTERVAL}" \
+        --duration "${CAM_MONITOR_DURATION}" &
+    CAM_MONITOR_PID=$!
+    sleep 1
+    if kill -0 "${CAM_MONITOR_PID}" 2>/dev/null; then
+        echo "       Camera monitor running (PID ${CAM_MONITOR_PID})"
+        echo "       Collecting ${CAMERA_BASELINE_DURATION}s baseline before starting RTSP..."
+        sleep "${CAMERA_BASELINE_DURATION}"
+    else
+        echo "       WARNING: Camera monitor failed to start. Continuing without it."
+        CAM_MONITOR_PID=""
+    fi
+else
+    echo "[2.7/6] Camera SoC monitoring skipped (set CAMERA_TELNET_PASSWORD to enable)"
+fi
 
 # ---------------------------------------------------------------------------
 # Start packet capture
@@ -157,6 +196,15 @@ snapshot_system() {
         grep "${NETWORK_INTERFACE}" /proc/net/dev
         echo "--- loadavg ---"
         cat /proc/loadavg
+        echo "--- thermal ---"
+        # Try thermal_zone first (Raspberry Pi, ARM SBCs)
+        for tz in /sys/class/thermal/thermal_zone*/temp; do
+            [ -r "$tz" ] && echo "tz_$(basename "$(dirname "$tz")"):$(cat "$tz")"
+        done
+        # Fallback: hwmon sensors (desktops, servers)
+        for hw in /sys/class/hwmon/hwmon*/temp*_input; do
+            [ -r "$hw" ] && echo "hwmon_$(basename "$(dirname "$hw")")_$(basename "$hw" _input):$(cat "$hw")"
+        done
     } > "${OUT}" 2>/dev/null
 }
 
@@ -213,6 +261,13 @@ wait "${GST_PID}" 2>/dev/null || true
 kill "${TCPDUMP_PID}" 2>/dev/null || true
 wait "${TCPDUMP_PID}" 2>/dev/null || true
 
+# Stop camera SoC monitor
+if [ -n "${CAM_MONITOR_PID}" ] && kill -0 "${CAM_MONITOR_PID}" 2>/dev/null; then
+    kill "${CAM_MONITOR_PID}" 2>/dev/null || true
+    wait "${CAM_MONITOR_PID}" 2>/dev/null || true
+    echo "       Camera SoC monitor stopped."
+fi
+
 PCAP_SIZE=$(du -h "${PCAP_FILE}" | cut -f1)
 echo "       Capture complete: ${PCAP_FILE} (${PCAP_SIZE})"
 
@@ -267,10 +322,16 @@ fi
 # ---------------------------------------------------------------------------
 echo "[6/6] Analyzing packets and generating report..."
 
+CAM_MONITOR_ARG=""
+if [ -f "${CAM_MONITOR_FILE}" ]; then
+    CAM_MONITOR_ARG="--camera-monitor ${CAM_MONITOR_FILE}"
+fi
+
 python3 /app/analyze.py "${CSV_FILE}" \
     --output-dir "${RUN_DIR}" \
     --metadata "${RUN_DIR}/metadata.json" \
-    --sysmon-dir "${SYSMON_DIR}"
+    --sysmon-dir "${SYSMON_DIR}" \
+    ${CAM_MONITOR_ARG}
 
 python3 /app/report.py "${RUN_DIR}"
 

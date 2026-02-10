@@ -275,30 +275,6 @@ def generate_html(run_dir: str) -> str:
 """
 
     # ---------------------------------------------------------------------------
-    # Video Player (if video.mp4 exists in the run directory)
-    # ---------------------------------------------------------------------------
-    video_path = rd / "video.mp4"
-    if video_path.exists():
-        video_size_mb = video_path.stat().st_size / (1024 * 1024)
-        # Base64-embed small videos (<50MB), reference larger ones
-        if video_size_mb < 50:
-            with open(video_path, "rb") as vf:
-                video_b64 = base64.b64encode(vf.read()).decode("ascii")
-            video_src = f"data:video/mp4;base64,{video_b64}"
-        else:
-            video_src = "video.mp4"
-        html += f"""
-<h2>Captured Video</h2>
-<div style="text-align:center; margin:1.5rem 0;">
-  <video controls preload="metadata" style="max-width:100%; border:1px solid var(--border); border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
-    <source src="{video_src}" type="video/mp4">
-    Your browser does not support the video tag.
-  </video>
-  <div class="plot-caption">Captured video ({video_size_mb:.1f} MB, no re-encoding). Recorded directly from the RTSP stream during the analysis capture window.</div>
-</div>
-"""
-
-    # ---------------------------------------------------------------------------
     # System Context section
     # ---------------------------------------------------------------------------
     sys_meta = meta.get("system", {})
@@ -346,6 +322,25 @@ def generate_html(run_dir: str) -> str:
     if la_end:
         html += f'  <tr><td>Load Average (end)</td><td class="num">{la_end[0]:.2f} / {la_end[1]:.2f} / {la_end[2]:.2f}</td></tr>\n'
 
+    # Temperature during capture
+    temp_mean = sm.get("temp_mean_c")
+    temp_min = sm.get("temp_min_c")
+    temp_max = sm.get("temp_max_c")
+    temp_start = sm.get("temp_start_c")
+    temp_end = sm.get("temp_end_c")
+    if any(v is not None for v in [temp_mean, temp_start, temp_end]):
+        html += '  <tr><th colspan="2">Temperature During Capture</th></tr>\n'
+        if temp_mean is not None:
+            html += f'  <tr><td>Average</td><td class="num">{temp_mean}&deg;C</td></tr>\n'
+        if temp_min is not None:
+            html += f'  <tr><td>Min</td><td class="num">{temp_min}&deg;C</td></tr>\n'
+        if temp_max is not None:
+            html += f'  <tr><td>Max</td><td class="num">{temp_max}&deg;C</td></tr>\n'
+        if temp_start is not None:
+            html += f'  <tr><td>At Capture Start</td><td class="num">{temp_start}&deg;C</td></tr>\n'
+        if temp_end is not None:
+            html += f'  <tr><td>At Capture End</td><td class="num">{temp_end}&deg;C</td></tr>\n'
+
     # Network / Bandwidth
     html += '  <tr><th colspan="2">Network &amp; Bandwidth</th></tr>\n'
     link_speed = sys_meta.get("link_speed_mbps", "N/A")
@@ -379,7 +374,7 @@ def generate_html(run_dir: str) -> str:
     # ---------------------------------------------------------------------------
     # Camera Settings section (RadCam only)
     # ---------------------------------------------------------------------------
-    cam = stats.get("metadata", {}).get("camera", {})
+    cam = stats.get("camera_info", {})
     if cam.get("detected"):
         html += "\n<h2>2. Camera Settings</h2>\n"
         html += '<p>Collected via the RadCam proprietary HTTP API at capture time. '
@@ -506,6 +501,106 @@ def generate_html(run_dir: str) -> str:
     else:
         section_offset = 2
 
+    # ---------------------------------------------------------------------------
+    # Camera SoC Monitoring section (telnet-based)
+    # ---------------------------------------------------------------------------
+    csoc = stats.get("camera_soc", {})
+    if csoc.get("sample_count", 0) > 0:
+        html += f"\n<h2>{section_offset}. Camera SoC Monitoring</h2>\n"
+        html += '<p>Collected via telnet into the camera\'s Linux shell during the capture. '
+        html += 'Baseline samples were taken <em>before</em> the RTSP stream was started.</p>\n'
+
+        has_baseline = csoc.get("baseline_samples", 0) > 0
+
+        # Temperature table
+        html += '<table class="stat-table">\n'
+        html += '  <tr><th colspan="2">SoC Temperature</th></tr>\n'
+        if has_baseline:
+            for label, key in [
+                ("Baseline (avg)", "baseline_temp_mean_c"),
+                ("Baseline (min / max)", None),
+                ("Streaming (avg)", "streaming_temp_mean_c"),
+                ("Streaming (min / max)", None),
+            ]:
+                if key is None:
+                    if "baseline" in label:
+                        lo = csoc.get("baseline_temp_min_c")
+                        hi = csoc.get("baseline_temp_max_c")
+                    else:
+                        lo = csoc.get("streaming_temp_min_c")
+                        hi = csoc.get("streaming_temp_max_c")
+                    if lo is not None and hi is not None:
+                        html += f'  <tr><td>{label}</td><td class="num">{lo}&deg;C / {hi}&deg;C</td></tr>\n'
+                else:
+                    val = csoc.get(key)
+                    if val is not None:
+                        html += f'  <tr><td>{label}</td><td class="num">{val}&deg;C</td></tr>\n'
+        ov_temp = csoc.get("overall_temp_mean_c")
+        ov_lo = csoc.get("overall_temp_min_c")
+        ov_hi = csoc.get("overall_temp_max_c")
+        if ov_temp is not None:
+            html += f'  <tr><td>Overall (avg)</td><td class="num">{ov_temp}&deg;C</td></tr>\n'
+        if ov_lo is not None and ov_hi is not None:
+            html += f'  <tr><td>Overall (min / max)</td><td class="num">{ov_lo}&deg;C / {ov_hi}&deg;C</td></tr>\n'
+
+        # CPU table
+        html += '  <tr><th colspan="2">SoC CPU Usage</th></tr>\n'
+        if has_baseline:
+            for phase, prefix in [("Baseline", "baseline"), ("Streaming", "streaming")]:
+                cpu_mean = csoc.get(f"{prefix}_cpu_mean_pct")
+                cpu_min = csoc.get(f"{prefix}_cpu_min_pct")
+                cpu_max = csoc.get(f"{prefix}_cpu_max_pct")
+                if cpu_mean is not None:
+                    html += f'  <tr><td>{phase} (avg)</td><td class="num">{cpu_mean}%</td></tr>\n'
+                if cpu_min is not None and cpu_max is not None:
+                    html += f'  <tr><td>{phase} (min / max)</td><td class="num">{cpu_min}% / {cpu_max}%</td></tr>\n'
+        ov_cpu = csoc.get("overall_cpu_mean_pct")
+        if ov_cpu is not None:
+            html += f'  <tr><td>Overall (avg)</td><td class="num">{ov_cpu}%</td></tr>\n'
+
+        # Memory table
+        html += '  <tr><th colspan="2">SoC Memory Usage</th></tr>\n'
+        mem_total = csoc.get("overall_mem_total_kb")
+        if mem_total:
+            html += f'  <tr><td>Total</td><td class="num">{mem_total // 1024} MB ({mem_total} KB)</td></tr>\n'
+        if has_baseline:
+            for phase, prefix in [("Baseline", "baseline"), ("Streaming", "streaming")]:
+                mem_mean = csoc.get(f"{prefix}_mem_mean_pct")
+                if mem_mean is not None:
+                    html += f'  <tr><td>{phase} (avg used)</td><td class="num">{mem_mean}%</td></tr>\n'
+        ov_mem = csoc.get("overall_mem_mean_pct")
+        if ov_mem is not None:
+            html += f'  <tr><td>Overall (avg used)</td><td class="num">{ov_mem}%</td></tr>\n'
+
+        # Voltages
+        core_v = csoc.get("overall_core_volt_mv")
+        cpu_v = csoc.get("overall_cpu_volt_mv")
+        npu_v = csoc.get("overall_npu_volt_mv")
+        if any(v is not None for v in [core_v, cpu_v, npu_v]):
+            html += '  <tr><th colspan="2">SoC Voltages</th></tr>\n'
+            if core_v is not None:
+                html += f'  <tr><td>Core</td><td class="num">{core_v} mV</td></tr>\n'
+            if cpu_v is not None:
+                html += f'  <tr><td>CPU</td><td class="num">{cpu_v} mV</td></tr>\n'
+            if npu_v is not None:
+                html += f'  <tr><td>NPU</td><td class="num">{npu_v} mV</td></tr>\n'
+
+        html += '</table>\n'
+
+        # Note about baseline
+        if has_baseline:
+            rtsp_offset = csoc.get("rtsp_start_offset_s", 0)
+            html += f"""
+<div class="alert alert-info">
+  <strong>Baseline vs Streaming:</strong> The first {csoc['baseline_samples']} samples
+  ({rtsp_offset:.0f}s) were collected <em>before</em> the RTSP stream was initiated,
+  providing a no-load baseline. The remaining {csoc['streaming_samples']} samples were
+  collected while the camera was actively encoding and streaming video.
+</div>
+"""
+
+        section_offset += 1
+
     # Overview stats
     html += f"""
 <h2>{section_offset}. Frame Delivery Statistics</h2>
@@ -610,6 +705,8 @@ larger than P-frames. A threshold of 3x the median frame size is used.</p>
         "05_cumulative_excess": "Running sum of excess latency (any interval beyond the nominal frame period). Red vertical lines mark I-frame positions. Steeper slopes indicate periods of higher accumulated delay.",
         "06_jitter": "Delivery jitter, defined as the difference between the measured wall-clock interval and the expected interval derived from RTP timestamps. Zero means the frame arrived exactly when expected.",
         "07_size_vs_delivery": "Frame size plotted against delivery duration (first-to-last RTP packet), with a linear regression fit. This shows whether delivery time scales with frame size.",
+        "08_host_system": "Host system CPU usage, memory usage, and temperature over the capture duration. Sampled every 2 seconds from /proc.",
+        "09_camera_soc": "Camera SoC (HiSilicon) CPU usage, memory usage, and temperature over the capture duration, collected via telnet. The gray shaded region marks the baseline period before the RTSP stream was started.",
     }
 
     for plot in plots:

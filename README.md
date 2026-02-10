@@ -41,6 +41,7 @@ docker run --rm \
   --network=host \
   --cap-add=NET_RAW \
   --cap-add=NET_ADMIN \
+  -v /sys:/sys:ro \
   -e RTSP_URL=rtsp://192.168.2.10:554/stream_0 \
   -e CAPTURE_DURATION=60 \
   -v $(pwd)/output:/data \
@@ -91,6 +92,7 @@ docker run --rm `
   --network=host `
   --cap-add=NET_RAW `
   --cap-add=NET_ADMIN `
+  -v /sys:/sys:ro `
   -e RTSP_URL=rtsp://192.168.2.10:554/stream_0 `
   -e CAPTURE_DURATION=60 `
   -v "${PWD}/output:/data" `
@@ -146,6 +148,7 @@ docker run --rm \
   --network=host \
   --cap-add=NET_RAW \
   --cap-add=NET_ADMIN \
+  -v /sys:/sys:ro \
   -e RTSP_URL=rtsp://192.168.2.10:554/stream_0 \
   -e CAPTURE_DURATION=60 \
   -v "$(pwd)/output:/data" \
@@ -236,6 +239,7 @@ docker run --rm \
   --network=host \
   --cap-add=NET_RAW \
   --cap-add=NET_ADMIN \
+  -v /sys:/sys:ro \
   -e RTSP_URL=rtsp://192.168.2.10:554/stream_0 \
   -e CAPTURE_DURATION=60 \
   -v $(pwd)/output:/data \
@@ -266,6 +270,7 @@ scp rtp-frame-analyzer-arm64.tar.gz pi@<pi-ip>:~/
 # On the Pi: load and run
 docker load < rtp-frame-analyzer-arm64.tar.gz
 docker run --rm --network=host --cap-add=NET_RAW --cap-add=NET_ADMIN \
+  -v /sys:/sys:ro \
   -e RTSP_URL=rtsp://192.168.2.10:554/stream_0 \
   -v $(pwd)/output:/data \
   rtp-frame-analyzer:arm64
@@ -314,7 +319,7 @@ Additionally, **`--network=host`** is required so the container shares the host'
 These are set automatically in `docker-compose.yml`. If running `docker run` manually, include all three flags:
 
 ```bash
-docker run --network=host --cap-add=NET_RAW --cap-add=NET_ADMIN ...
+docker run --network=host --cap-add=NET_RAW --cap-add=NET_ADMIN -v /sys:/sys:ro ...
 ```
 
 ---
