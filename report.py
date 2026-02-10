@@ -275,6 +275,30 @@ def generate_html(run_dir: str) -> str:
 """
 
     # ---------------------------------------------------------------------------
+    # Video Player (if video.mp4 exists in the run directory)
+    # ---------------------------------------------------------------------------
+    video_path = rd / "video.mp4"
+    if video_path.exists():
+        video_size_mb = video_path.stat().st_size / (1024 * 1024)
+        # Base64-embed small videos (<50MB), reference larger ones
+        if video_size_mb < 50:
+            with open(video_path, "rb") as vf:
+                video_b64 = base64.b64encode(vf.read()).decode("ascii")
+            video_src = f"data:video/mp4;base64,{video_b64}"
+        else:
+            video_src = "video.mp4"
+        html += f"""
+<h2>Captured Video</h2>
+<div style="text-align:center; margin:1.5rem 0;">
+  <video controls preload="metadata" style="max-width:100%; border:1px solid var(--border); border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+    <source src="{video_src}" type="video/mp4">
+    Your browser does not support the video tag.
+  </video>
+  <div class="plot-caption">Captured video ({video_size_mb:.1f} MB, no re-encoding). Recorded directly from the RTSP stream during the analysis capture window.</div>
+</div>
+"""
+
+    # ---------------------------------------------------------------------------
     # System Context section
     # ---------------------------------------------------------------------------
     sys_meta = meta.get("system", {})

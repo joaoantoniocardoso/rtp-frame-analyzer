@@ -87,9 +87,12 @@ echo "       tcpdump running (PID ${TCPDUMP_PID})"
 # ---------------------------------------------------------------------------
 echo "[4/6] Connecting RTSP client to ${RTSP_URL}..."
 
-gst-launch-1.0 \
+VIDEO_FILE="${RUN_DIR}/video.mp4"
+
+# -e (--eos-on-shutdown): when killed, sends EOS to properly finalize the MP4 container
+gst-launch-1.0 -e \
     rtspsrc location="${RTSP_URL}" latency=0 protocols=udp \
-    ! fakesink \
+    ! rtph264depay ! h264parse ! mp4mux ! filesink location="${VIDEO_FILE}" \
     > "${RUN_DIR}/gst_client.log" 2>&1 &
 GST_PID=$!
 sleep 3
@@ -154,14 +157,23 @@ wait "${MONITOR_PID}" 2>/dev/null || true
 snapshot_system "${SYSMON_DIR}/end.txt"
 
 echo "       Stopping capture..."
-kill "${GST_PID}" 2>/dev/null || true
-sleep 1
-kill "${TCPDUMP_PID}" 2>/dev/null || true
+# Send SIGINT to GStreamer so -e flag triggers EOS -> MP4 is finalized cleanly
+kill -INT "${GST_PID}" 2>/dev/null || true
+echo "       Waiting for MP4 finalization..."
+# Give GStreamer time to flush and finalize the MP4 container
 wait "${GST_PID}" 2>/dev/null || true
+kill "${TCPDUMP_PID}" 2>/dev/null || true
 wait "${TCPDUMP_PID}" 2>/dev/null || true
 
 PCAP_SIZE=$(du -h "${PCAP_FILE}" | cut -f1)
 echo "       Capture complete: ${PCAP_FILE} (${PCAP_SIZE})"
+
+if [ -f "${VIDEO_FILE}" ]; then
+    VIDEO_SIZE=$(du -h "${VIDEO_FILE}" | cut -f1)
+    echo "       Video saved: ${VIDEO_FILE} (${VIDEO_SIZE})"
+else
+    echo "       WARNING: Video file was not created (MP4 muxing may have failed)"
+fi
 
 # ---------------------------------------------------------------------------
 # Extract RTP fields with tshark
@@ -210,7 +222,7 @@ echo "[6/6] Analyzing packets and generating report..."
 python3 /app/analyze.py "${CSV_FILE}" \
     --output-dir "${RUN_DIR}" \
     --metadata "${RUN_DIR}/metadata.json" \
-    --sysmon-dir "${SYSMON_DIR}" \
+    --sysmon-dir "${SYSMON_DIR}"
 
 python3 /app/report.py "${RUN_DIR}"
 

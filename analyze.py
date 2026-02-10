@@ -579,21 +579,30 @@ def main():
     if args.metadata and os.path.exists(args.metadata):
         with open(args.metadata) as f:
             stats["metadata"] = json.load(f)
+        # Extract camera info and store at top level for report.py
         camera_info = stats["metadata"].get("camera", {})
         if camera_info.get("detected"):
+            stats["camera_info"] = camera_info
             venc = camera_info.get("venc_config_ch0") or {}
+            sys_cfg = camera_info.get("sys_config") or {}
+            print(f"  Camera: {camera_info.get('type', 'Unknown')}")
+            if sys_cfg.get("version"):
+                print(f"  Firmware: {sys_cfg['version']}")
             if venc.get("pic_width"):
                 profile_map = {0: "Baseline", 1: "Main", 2: "High"}
                 encode_map = {1: "H.264", 2: "H.265"}
                 rc_map = {0: "VBR", 1: "CBR"}
-                print(f"  Camera: {camera_info.get('type', 'Unknown')} - "
-                      f"{encode_map.get(venc.get('encode_type'), '?')} "
+                print(f"  Encoder: {encode_map.get(venc.get('encode_type'), '?')} "
                       f"{venc.get('pic_width')}x{venc.get('pic_height')} "
                       f"@{venc.get('frame_rate')}fps "
                       f"GOP={venc.get('gop')} "
                       f"BR={venc.get('bitrate')}kbps "
                       f"{profile_map.get(venc.get('encode_profile'), '?')} "
                       f"{rc_map.get(venc.get('rc_mode'), '?')}")
+        else:
+            stats["camera_info"] = {"detected": False}
+    else:
+        stats["camera_info"] = {"detected": False}
 
     print("  Generating plots...")
     generate_plots(frames, stats, out_dir)
