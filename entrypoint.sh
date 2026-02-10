@@ -83,16 +83,32 @@ fi
 echo "       tcpdump running (PID ${TCPDUMP_PID})"
 
 # ---------------------------------------------------------------------------
-# Start RTSP client to trigger the stream
+# Start RTSP client to trigger the stream + record video
 # ---------------------------------------------------------------------------
 echo "[4/6] Connecting RTSP client to ${RTSP_URL}..."
 
 VIDEO_FILE="${RUN_DIR}/video.mp4"
 
-# -e (--eos-on-shutdown): when killed, sends EOS to properly finalize the MP4 container
+# Pipeline explanation:
+#   rtph264depay: extracts H.264 NAL units from RTP packets
+#   queue:        decouples rtspsrc timing from the rest of the pipeline
+#   h264parse config-interval=-1: injects SPS/PPS before every I-frame
+#   video/x-h264,stream-format=avc,alignment=au: ensures access-unit alignment for mp4mux
+#   h264timestamper: assigns PTS to buffers that lack one — without this, mp4mux
+#                    fatally errors with "Buffer has no PTS" on slower systems
+#                    (e.g. Raspberry Pi) where initial RTSP buffers arrive before
+#                    timestamps are established.
+#   mp4mux:       muxes into browser-compatible MP4 container
+#   -e (--eos-on-shutdown): on SIGINT, sends EOS for clean MP4 finalization.
 gst-launch-1.0 -e \
     rtspsrc location="${RTSP_URL}" latency=0 protocols=udp \
-    ! rtph264depay ! h264parse ! mp4mux ! filesink location="${VIDEO_FILE}" \
+    ! rtph264depay \
+    ! queue \
+    ! h264parse config-interval=-1 \
+    ! "video/x-h264,stream-format=avc,alignment=au" \
+    ! h264timestamper \
+    ! mp4mux \
+    ! filesink location="${VIDEO_FILE}" \
     > "${RUN_DIR}/gst_client.log" 2>&1 &
 GST_PID=$!
 sleep 3
@@ -105,6 +121,25 @@ if ! kill -0 "${GST_PID}" 2>/dev/null; then
     exit 1
 fi
 echo "       RTSP client connected (PID ${GST_PID})"
+
+# Watchdog: if the recording pipeline dies mid-capture, restart with fakesink
+# to keep the RTSP session alive so tcpdump still collects data.
+(
+    while sleep 5; do
+        if ! kill -0 "${GST_PID}" 2>/dev/null; then
+            echo "       WARNING: Recording pipeline died. Restarting with fakesink..."
+            gst-launch-1.0 \
+                rtspsrc location="${RTSP_URL}" latency=0 protocols=udp \
+                ! fakesink \
+                > "${RUN_DIR}/gst_fallback.log" 2>&1 &
+            FALLBACK_PID=$!
+            echo "${FALLBACK_PID}" > "${RUN_DIR}/.fallback_pid"
+            echo "       Fallback RTSP client running (PID ${FALLBACK_PID})"
+            break
+        fi
+    done
+) &
+WATCHDOG_PID=$!
 
 # ---------------------------------------------------------------------------
 # Snapshot helper: reads /proc counters into a file
@@ -157,6 +192,19 @@ wait "${MONITOR_PID}" 2>/dev/null || true
 snapshot_system "${SYSMON_DIR}/end.txt"
 
 echo "       Stopping capture..."
+
+# Stop watchdog
+kill "${WATCHDOG_PID}" 2>/dev/null || true
+wait "${WATCHDOG_PID}" 2>/dev/null || true
+
+# Stop fallback RTSP client if the watchdog spawned one
+if [ -f "${RUN_DIR}/.fallback_pid" ]; then
+    FALLBACK_PID=$(cat "${RUN_DIR}/.fallback_pid")
+    kill "${FALLBACK_PID}" 2>/dev/null || true
+    wait "${FALLBACK_PID}" 2>/dev/null || true
+    rm -f "${RUN_DIR}/.fallback_pid"
+fi
+
 # Send SIGINT to GStreamer so -e flag triggers EOS -> MP4 is finalized cleanly
 kill -INT "${GST_PID}" 2>/dev/null || true
 echo "       Waiting for MP4 finalization..."
