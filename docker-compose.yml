@@ -1,0 +1,14 @@
+services:
+  analyzer:
+    build: .
+    image: rtp-frame-analyzer
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      - RTSP_URL=${RTSP_URL:?Set RTSP_URL in .env or environment}
+      - CAPTURE_DURATION=${CAPTURE_DURATION:-60}
+      - NETWORK_INTERFACE=${NETWORK_INTERFACE:-auto}
+    volumes:
+      - ${OUTPUT_DIR:-./output}:/data

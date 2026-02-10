@@ -1,0 +1,9 @@
+*.pcap
+*.csv
+*.png
+*.html
+*.jsonl
+*.json
+output/
+__pycache__/
+.git/
