@@ -16,10 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-matplotlib \
     iproute2 \
     iputils-ping \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY entrypoint.sh analyze.py report.py ./
+COPY entrypoint.sh analyze.py report.py collect_metadata.py ./
 RUN chmod +x entrypoint.sh
 
 # Default configuration via environment variables

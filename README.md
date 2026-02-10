@@ -116,9 +116,11 @@ output/
     ├── capture.pcap         # Raw packet capture (can be opened in Wireshark)
     ├── rtp_packets.csv      # Extracted RTP packet fields
     ├── metadata.json        # Run configuration metadata
+    ├── camera_info.json     # Camera settings (RadCam only, or {"detected": false})
     ├── stats.json           # Computed statistics (machine-readable)
     ├── frame_log.jsonl      # Per-frame timing data (NDJSON)
     ├── gst_client.log       # GStreamer RTSP client log
+    ├── sysmon/              # System monitoring snapshots during capture
     ├── 01_timeseries.png    # Inter-frame interval over time
     ├── 02_distributions.png # I-frame and P-frame interval distributions
     ├── 03_scatter.png       # Frame size vs delivery interval
@@ -132,13 +134,25 @@ output/
 
 The HTML report includes:
 
-1. **Run metadata** (RTSP URL, duration, interface, host)
-2. **Key finding summary** with I-frame latency ratio
-3. **Statistics table** with per-frame-type metrics (median, P95, P99, max intervals; sizes; delivery durations; packet counts)
+1. **System context** (host hardware, CPU/memory usage, network bandwidth)
+2. **Camera settings** (RadCam only: firmware, encoder config, image settings — auto-detected)
+3. **Frame delivery statistics** with per-frame-type metrics (median, P95, P99, max intervals; sizes; delivery durations; packet counts)
 4. **Linear regression** of frame size vs delivery duration
-5. **7 analysis plots** with detailed captions
-6. **Methodology** section explaining the measurement approach
-7. **Interpretation** with root cause analysis and mitigations
+5. **Methodology** section explaining the measurement approach
+6. **7 analysis plots** with detailed captions
+7. **Observations** — neutral, data-driven findings
+
+### Camera Metadata (RadCam)
+
+When the target camera is a RadCam (HiSilicon-based), the tool automatically queries its proprietary HTTP API to collect:
+
+- **System config**: firmware version, device name, MAC address, platform version
+- **Encoder settings** (both channels): resolution, framerate, GOP, bitrate, codec, profile, rate control mode
+- **RTSP config**: transport settings
+- **Image adjustment**: brightness, contrast, sharpness, saturation, exposure, AWB, gain
+- **Extended image settings**: flip, mirror, WDR, noise reduction, lens correction, IR cut
+
+This metadata is saved to `camera_info.json` and embedded in the report for cross-comparison across different camera configurations. If the camera is not a RadCam (or the API is unreachable), this section is silently skipped.
 
 ## How It Works
 

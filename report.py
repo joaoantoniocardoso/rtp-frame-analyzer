@@ -274,9 +274,217 @@ def generate_html(run_dir: str) -> str:
 </div>
 """
 
+    # ---------------------------------------------------------------------------
+    # System Context section
+    # ---------------------------------------------------------------------------
+    sys_meta = meta.get("system", {})
+    sm = stats.get("system_metrics", {})
+    bw = stats.get("bandwidth", {})
+
+    html += "\n<h2>1. System Context</h2>\n"
+    html += '<table class="stat-table">\n'
+
+    # Host hardware / OS
+    html += '  <tr><th colspan="2">Host</th></tr>\n'
+    for label, val in [
+        ("Hostname", hostname),
+        ("OS", sys_meta.get("os", "N/A")),
+        ("Kernel", sys_meta.get("kernel", "N/A")),
+        ("Architecture", sys_meta.get("arch", "N/A")),
+        ("CPU Model", sys_meta.get("cpu_model", "N/A")),
+        ("CPU Cores", sys_meta.get("cpu_cores", "N/A")),
+        ("CPU Governor", sys_meta.get("cpu_governor", "N/A")),
+    ]:
+        if val and val != "N/A":
+            html += f'  <tr><td>{label}</td><td class="num">{val}</td></tr>\n'
+
+    # Memory
+    html += '  <tr><th colspan="2">Memory</th></tr>\n'
+    mem_total = sm.get("mem_total_mb")
+    mem_avail = sm.get("mem_available_mb")
+    mem_pct = sm.get("mem_used_pct")
+    html += f'  <tr><td>Total</td><td class="num">{int(mem_total)} MB</td></tr>\n' if mem_total else ""
+    html += f'  <tr><td>Available (at capture start)</td><td class="num">{int(mem_avail)} MB</td></tr>\n' if mem_avail else ""
+    html += f'  <tr><td>Used</td><td class="num">{mem_pct}%</td></tr>\n' if mem_pct is not None else ""
+
+    # CPU during capture
+    html += '  <tr><th colspan="2">CPU During Capture</th></tr>\n'
+    cpu_pct = sm.get("cpu_usage_pct")
+    cpu_idle = sm.get("cpu_idle_pct")
+    cpu_iow = sm.get("cpu_iowait_pct")
+    html += f'  <tr><td>Average Usage</td><td class="num">{cpu_pct}%</td></tr>\n' if cpu_pct is not None else ""
+    html += f'  <tr><td>Idle</td><td class="num">{cpu_idle}%</td></tr>\n' if cpu_idle is not None else ""
+    html += f'  <tr><td>I/O Wait</td><td class="num">{cpu_iow}%</td></tr>\n' if cpu_iow is not None else ""
+    la_start = sm.get("loadavg_start")
+    la_end = sm.get("loadavg_end")
+    if la_start:
+        html += f'  <tr><td>Load Average (start)</td><td class="num">{la_start[0]:.2f} / {la_start[1]:.2f} / {la_start[2]:.2f}</td></tr>\n'
+    if la_end:
+        html += f'  <tr><td>Load Average (end)</td><td class="num">{la_end[0]:.2f} / {la_end[1]:.2f} / {la_end[2]:.2f}</td></tr>\n'
+
+    # Network / Bandwidth
+    html += '  <tr><th colspan="2">Network &amp; Bandwidth</th></tr>\n'
+    link_speed = sys_meta.get("link_speed_mbps", "N/A")
+    html += f'  <tr><td>Interface</td><td class="num">{iface}</td></tr>\n'
+    if link_speed and link_speed != "N/A":
+        html += f'  <tr><td>Link Speed</td><td class="num">{link_speed} Mbps</td></tr>\n'
+    net_rx = sm.get("net_rx_mbps")
+    net_tx = sm.get("net_tx_mbps")
+    if net_rx is not None:
+        html += f'  <tr><td>Interface RX (total, during capture)</td><td class="num">{net_rx} Mbps</td></tr>\n'
+    if net_tx is not None:
+        html += f'  <tr><td>Interface TX (total, during capture)</td><td class="num">{net_tx} Mbps</td></tr>\n'
+    rtp_bw = bw.get("rtp_bandwidth_mbps")
+    rtp_pps = bw.get("rtp_packet_rate_pps")
+    rtp_avg = bw.get("rtp_avg_packet_size")
+    rtp_total = bw.get("rtp_total_bytes")
+    if rtp_bw is not None:
+        html += f'  <tr><td>RTP Stream Bandwidth</td><td class="num">{rtp_bw} Mbps</td></tr>\n'
+    if rtp_pps is not None:
+        html += f'  <tr><td>RTP Packet Rate</td><td class="num">{rtp_pps} pps</td></tr>\n'
+    if rtp_avg is not None:
+        html += f'  <tr><td>RTP Avg Packet Size</td><td class="num">{int(rtp_avg)} bytes</td></tr>\n'
+    if rtp_total is not None:
+        html += f'  <tr><td>RTP Total Data</td><td class="num">{rtp_total / 1024 / 1024:.1f} MB</td></tr>\n'
+    if net_rx is not None and rtp_bw is not None and net_rx > 0:
+        rtp_share = rtp_bw / net_rx * 100
+        html += f'  <tr><td>RTP Share of Interface RX</td><td class="num">{rtp_share:.1f}%</td></tr>\n'
+
+    html += "</table>\n"
+
+    # ---------------------------------------------------------------------------
+    # Camera Settings section (RadCam only)
+    # ---------------------------------------------------------------------------
+    cam = stats.get("metadata", {}).get("camera", {})
+    if cam.get("detected"):
+        html += "\n<h2>2. Camera Settings</h2>\n"
+        html += '<p>Collected via the RadCam proprietary HTTP API at capture time. '
+        html += 'These settings were active during the measurement.</p>\n'
+
+        # System / Firmware
+        sys_cfg = cam.get("sys_config") or {}
+        if sys_cfg:
+            html += '<table class="stat-table">\n'
+            html += '  <tr><th colspan="2">Camera Identity &amp; Firmware</th></tr>\n'
+            for label, key in [
+                ("Device Name", "dev_name"),
+                ("Firmware Version", "version"),
+                ("Platform Version", "pf_version"),
+                ("User-Platform Version", "upf_version"),
+                ("Kernel Version", "kernel_version"),
+                ("Device Type", "dev_type"),
+                ("Device MAC", "device_mac"),
+                ("Device ID", "device_id"),
+                ("Driver Board Version", "driver_board_version"),
+            ]:
+                val = sys_cfg.get(key)
+                if val is not None and str(val).strip():
+                    html += f'  <tr><td>{label}</td><td class="num">{str(val).strip()}</td></tr>\n'
+            html += "</table>\n"
+
+        # Video Encoder (channel 0)
+        venc = cam.get("venc_config_ch0") or {}
+        if venc:
+            encode_type_map = {1: "H.264", 2: "H.265"}
+            profile_map = {0: "Baseline", 1: "Main", 2: "High"}
+            rc_map = {0: "VBR", 1: "CBR"}
+            html += '<table class="stat-table">\n'
+            html += '  <tr><th colspan="2">Video Encoder (Channel 0 &mdash; Primary Stream)</th></tr>\n'
+            for label, key, fmt_fn in [
+                ("Resolution", None, lambda v: f"{venc.get('pic_width')}x{venc.get('pic_height')}"),
+                ("Frame Rate", "frame_rate", lambda v: f"{v} fps"),
+                ("GOP (Group of Pictures)", "gop", lambda v: str(v)),
+                ("Bitrate", "bitrate", lambda v: f"{v} kbps ({v/1024:.1f} Mbps)"),
+                ("Codec", "encode_type", lambda v: encode_type_map.get(v, f"Unknown ({v})")),
+                ("H.264 Profile", "encode_profile", lambda v: profile_map.get(v, f"Unknown ({v})")),
+                ("Rate Control Mode", "rc_mode", lambda v: rc_map.get(v, f"Unknown ({v})")),
+                ("Max Frame Rate", "max_framerate", lambda v: f"{v} fps"),
+            ]:
+                if key is None:
+                    # Composite field
+                    if venc.get("pic_width") and venc.get("pic_height"):
+                        html += f'  <tr><td>{label}</td><td class="num">{fmt_fn(None)}</td></tr>\n'
+                else:
+                    val = venc.get(key)
+                    if val is not None:
+                        html += f'  <tr><td>{label}</td><td class="num">{fmt_fn(val)}</td></tr>\n'
+
+            # Supported resolutions
+            pix_list = venc.get("pixel_list", [])
+            if pix_list:
+                res_str = ", ".join(f"{p['width']}x{p['height']}" for p in pix_list if 'width' in p)
+                html += f'  <tr><td>Supported Resolutions</td><td class="num">{res_str}</td></tr>\n'
+            html += "</table>\n"
+
+        # Video Encoder (channel 1) -- if present and different
+        venc1 = cam.get("venc_config_ch1") or {}
+        if venc1 and venc1.get("pic_width"):
+            html += '<table class="stat-table">\n'
+            html += '  <tr><th colspan="2">Video Encoder (Channel 1 &mdash; Sub-Stream)</th></tr>\n'
+            for label, key, fmt_fn in [
+                ("Resolution", None, lambda v: f"{venc1.get('pic_width')}x{venc1.get('pic_height')}"),
+                ("Frame Rate", "frame_rate", lambda v: f"{v} fps"),
+                ("GOP", "gop", lambda v: str(v)),
+                ("Bitrate", "bitrate", lambda v: f"{v} kbps"),
+                ("Codec", "encode_type", lambda v: encode_type_map.get(v, f"Unknown ({v})")),
+                ("H.264 Profile", "encode_profile", lambda v: profile_map.get(v, f"Unknown ({v})")),
+                ("Rate Control Mode", "rc_mode", lambda v: rc_map.get(v, f"Unknown ({v})")),
+            ]:
+                if key is None:
+                    if venc1.get("pic_width") and venc1.get("pic_height"):
+                        html += f'  <tr><td>{label}</td><td class="num">{fmt_fn(None)}</td></tr>\n'
+                else:
+                    val = venc1.get(key)
+                    if val is not None:
+                        html += f'  <tr><td>{label}</td><td class="num">{fmt_fn(val)}</td></tr>\n'
+            html += "</table>\n"
+
+        # RTSP config
+        rtsp_cfg = cam.get("rtsp_config") or {}
+        if rtsp_cfg and rtsp_cfg.get("code") == 0:
+            html += '<table class="stat-table">\n'
+            html += '  <tr><th colspan="2">RTSP Configuration</th></tr>\n'
+            # Show all non-metadata fields
+            skip_keys = {"code", "device_mac", "deviceID", "device_id", "log", "device_ip", "sign_tby"}
+            for key, val in rtsp_cfg.items():
+                if key not in skip_keys and val is not None:
+                    html += f'  <tr><td>{key}</td><td class="num">{val}</td></tr>\n'
+            html += "</table>\n"
+
+        # Image adjustment
+        img_adj = cam.get("image_adjustment") or {}
+        if img_adj and img_adj.get("code") == 0:
+            html += '<table class="stat-table">\n'
+            html += '  <tr><th colspan="2">Image Adjustment Settings</th></tr>\n'
+            skip_keys = {"code", "device_mac", "deviceID", "device_id", "log",
+                         "device_ip", "sign_tby", "validSupport"}
+            for key, val in img_adj.items():
+                if key not in skip_keys and val is not None:
+                    nice_key = key.replace("_", " ").title()
+                    html += f'  <tr><td>{nice_key}</td><td class="num">{val}</td></tr>\n'
+            html += "</table>\n"
+
+        # Extended image adjustment
+        img_ex = cam.get("image_adjustment_ex") or {}
+        if img_ex and img_ex.get("code") == 0:
+            html += '<table class="stat-table">\n'
+            html += '  <tr><th colspan="2">Extended Image Settings</th></tr>\n'
+            skip_keys = {"code", "device_mac", "deviceID", "device_id", "log",
+                         "device_ip", "sign_tby"}
+            for key, val in img_ex.items():
+                if key not in skip_keys and val is not None:
+                    nice_key = key.replace("_", " ").title()
+                    html += f'  <tr><td>{nice_key}</td><td class="num">{val}</td></tr>\n'
+            html += "</table>\n"
+
+        # Bump remaining section numbers
+        section_offset = 3
+    else:
+        section_offset = 2
+
     # Overview stats
-    html += """
-<h2>1. Summary Statistics</h2>
+    html += f"""
+<h2>{section_offset}. Frame Delivery Statistics</h2>
 <table class="stat-table">
   <tr><th colspan="2">Overall</th></tr>
 """
@@ -332,8 +540,8 @@ def generate_html(run_dir: str) -> str:
     html += "</table>\n"
 
     # Methodology
-    html += """
-<h2>2. Methodology</h2>
+    html += f"""
+<h2>{section_offset + 1}. Methodology</h2>
 <div class="methodology">
 <h3>Measurement Point</h3>
 <p>This analysis measures frame delivery timing at the <strong>raw network packet level</strong>,
@@ -368,7 +576,7 @@ larger than P-frames. A threshold of 3x the median frame size is used.</p>
 """
 
     # Plots
-    html += "\n<h2>3. Analysis Plots</h2>\n"
+    html += f"\n<h2>{section_offset + 2}. Analysis Plots</h2>\n"
 
     plot_descriptions = {
         "01_timeseries": "Inter-frame arrival interval over time. Each point represents one frame. I-frames are shown as red diamonds, P-frames as blue dots. The green dashed line marks the nominal frame period.",
@@ -391,7 +599,7 @@ larger than P-frames. A threshold of 3x the median frame size is used.</p>
 """
 
     # Observations (neutral, data-driven)
-    html += "\n<h2>4. Observations</h2>\n"
+    html += f"\n<h2>{section_offset + 3}. Observations</h2>\n"
     html += """<div class="methodology">
 <p>The following observations are derived from the measured data. They describe what was
 observed during this specific capture and may not generalize to other configurations,

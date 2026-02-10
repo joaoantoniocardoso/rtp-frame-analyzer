@@ -217,7 +217,171 @@ def save_frame_log(frames: list[dict], path: str):
 
 
 # ---------------------------------------------------------------------------
-# 7. Plots
+# 7. System metrics from sysmon snapshots
+# ---------------------------------------------------------------------------
+
+def _parse_snapshot(path: str) -> dict | None:
+    """Parse a single sysmon snapshot file."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return None
+
+    snap: dict = {}
+
+    # Timestamp
+    for line in text.splitlines():
+        try:
+            snap["ts"] = float(line.strip())
+            break
+        except ValueError:
+            continue
+
+    # CPU from /proc/stat: cpu  user nice system idle iowait irq softirq steal
+    for line in text.splitlines():
+        if line.startswith("cpu "):
+            parts = line.split()
+            vals = [int(x) for x in parts[1:]]
+            snap["cpu_user"] = vals[0]
+            snap["cpu_nice"] = vals[1]
+            snap["cpu_system"] = vals[2]
+            snap["cpu_idle"] = vals[3]
+            snap["cpu_iowait"] = vals[4] if len(vals) > 4 else 0
+            snap["cpu_irq"] = vals[5] if len(vals) > 5 else 0
+            snap["cpu_softirq"] = vals[6] if len(vals) > 6 else 0
+            snap["cpu_steal"] = vals[7] if len(vals) > 7 else 0
+            snap["cpu_total"] = sum(vals[:8]) if len(vals) >= 8 else sum(vals)
+            snap["cpu_busy"] = snap["cpu_total"] - snap["cpu_idle"] - snap["cpu_iowait"]
+            break
+
+    # Memory
+    for line in text.splitlines():
+        for key in ("MemTotal", "MemFree", "MemAvailable", "Cached", "Buffers"):
+            if line.startswith(key + ":"):
+                snap[f"mem_{key.lower()}_kb"] = int(line.split()[1])
+
+    # Network: /proc/net/dev line
+    # face |bytes packets ... (rx) | bytes packets ... (tx)
+    for line in text.splitlines():
+        if ":" in line and not line.startswith("---"):
+            parts = line.split(":")
+            if len(parts) == 2:
+                vals = parts[1].split()
+                if len(vals) >= 16:
+                    try:
+                        snap["net_rx_bytes"] = int(vals[0])
+                        snap["net_rx_packets"] = int(vals[1])
+                        snap["net_tx_bytes"] = int(vals[8])
+                        snap["net_tx_packets"] = int(vals[9])
+                    except (ValueError, IndexError):
+                        pass
+
+    # Load average
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                la1, la5, la15 = float(parts[0]), float(parts[1]), float(parts[2])
+                if 0 < la1 < 1000:  # sanity check
+                    snap["loadavg_1"] = la1
+                    snap["loadavg_5"] = la5
+                    snap["loadavg_15"] = la15
+            except ValueError:
+                continue
+
+    return snap if "ts" in snap else None
+
+
+def parse_sysmon(sysmon_dir: str) -> dict:
+    """
+    Parse all sysmon snapshots and compute aggregate system metrics for the
+    capture window (start.txt -> end.txt), plus per-sample timeseries.
+    """
+    sd = Path(sysmon_dir)
+    result: dict = {}
+
+    start = _parse_snapshot(str(sd / "start.txt"))
+    end = _parse_snapshot(str(sd / "end.txt"))
+
+    if not start or not end:
+        return result
+
+    # Aggregate CPU usage over the capture window
+    if "cpu_total" in start and "cpu_total" in end:
+        d_total = end["cpu_total"] - start["cpu_total"]
+        d_busy = end["cpu_busy"] - start["cpu_busy"]
+        d_idle = (end["cpu_idle"] + end.get("cpu_iowait", 0)) - (
+            start["cpu_idle"] + start.get("cpu_iowait", 0)
+        )
+        if d_total > 0:
+            result["cpu_usage_pct"] = round(d_busy / d_total * 100, 1)
+            result["cpu_idle_pct"] = round(d_idle / d_total * 100, 1)
+            result["cpu_iowait_pct"] = round(
+                (end.get("cpu_iowait", 0) - start.get("cpu_iowait", 0)) / d_total * 100, 1
+            )
+
+    # Network bandwidth over the capture window
+    wall_dt = end.get("ts", 0) - start.get("ts", 0)
+    if wall_dt > 0 and "net_rx_bytes" in start and "net_rx_bytes" in end:
+        rx_bytes = end["net_rx_bytes"] - start["net_rx_bytes"]
+        tx_bytes = end["net_tx_bytes"] - start["net_tx_bytes"]
+        result["net_rx_mbps"] = round(rx_bytes * 8 / wall_dt / 1e6, 2)
+        result["net_tx_mbps"] = round(tx_bytes * 8 / wall_dt / 1e6, 2)
+        result["net_rx_bytes"] = rx_bytes
+        result["net_tx_bytes"] = tx_bytes
+
+    # Memory at capture start
+    if "mem_memtotal_kb" in start:
+        result["mem_total_mb"] = round(start["mem_memtotal_kb"] / 1024, 0)
+    if "mem_memavailable_kb" in start:
+        result["mem_available_mb"] = round(start["mem_memavailable_kb"] / 1024, 0)
+    if "mem_memtotal_kb" in start and "mem_memavailable_kb" in start:
+        used = start["mem_memtotal_kb"] - start["mem_memavailable_kb"]
+        result["mem_used_pct"] = round(used / start["mem_memtotal_kb"] * 100, 1)
+
+    # Load average at start and end
+    if "loadavg_1" in start:
+        result["loadavg_start"] = [start.get("loadavg_1"), start.get("loadavg_5"), start.get("loadavg_15")]
+    if "loadavg_1" in end:
+        result["loadavg_end"] = [end.get("loadavg_1"), end.get("loadavg_5"), end.get("loadavg_15")]
+
+    # Per-sample CPU timeseries for plotting
+    samples = sorted(sd.glob("sample_*.txt"))
+    if len(samples) >= 2:
+        cpu_ts = []
+        prev_snap = _parse_snapshot(str(samples[0]))
+        for sp in samples[1:]:
+            curr_snap = _parse_snapshot(str(sp))
+            if prev_snap and curr_snap and "cpu_total" in prev_snap and "cpu_total" in curr_snap:
+                dt = curr_snap["cpu_total"] - prev_snap["cpu_total"]
+                db = curr_snap["cpu_busy"] - prev_snap["cpu_busy"]
+                if dt > 0:
+                    cpu_ts.append({
+                        "t": curr_snap.get("ts", 0) - start.get("ts", 0),
+                        "cpu_pct": round(db / dt * 100, 1),
+                    })
+            prev_snap = curr_snap
+        result["cpu_timeseries"] = cpu_ts
+
+    return result
+
+
+def compute_bandwidth(packets: list[dict], duration_s: float) -> dict:
+    """Compute RTP stream bandwidth from raw packets."""
+    if not packets or duration_s <= 0:
+        return {}
+    total_bytes = sum(p["udp_len"] for p in packets)
+    return {
+        "rtp_total_bytes": total_bytes,
+        "rtp_bandwidth_mbps": round(total_bytes * 8 / duration_s / 1e6, 2),
+        "rtp_packet_rate_pps": round(len(packets) / duration_s, 1),
+        "rtp_avg_packet_size": round(total_bytes / len(packets), 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Plots
 # ---------------------------------------------------------------------------
 
 def generate_plots(frames: list[dict], stats: dict, out_dir: str):
@@ -372,6 +536,7 @@ def main():
     parser.add_argument("csv_file", help="Path to tshark-extracted RTP CSV")
     parser.add_argument("--output-dir", default=None, help="Output directory")
     parser.add_argument("--metadata", default=None, help="Path to run metadata JSON")
+    parser.add_argument("--sysmon-dir", default=None, help="Path to sysmon snapshot directory")
     args = parser.parse_args()
 
     out_dir = args.output_dir or str(Path(args.csv_file).parent / "analysis")
@@ -397,10 +562,38 @@ def main():
     print("  Computing statistics...")
     stats = compute_stats(frames)
 
-    # Merge metadata if available
+    # RTP bandwidth
+    print("  Computing bandwidth...")
+    bw = compute_bandwidth(packets, stats.get("duration_s", 0))
+    stats["bandwidth"] = bw
+
+    # System metrics
+    if args.sysmon_dir and os.path.isdir(args.sysmon_dir):
+        print("  Parsing system metrics...")
+        sysmon = parse_sysmon(args.sysmon_dir)
+        stats["system_metrics"] = sysmon
+    else:
+        stats["system_metrics"] = {}
+
+    # Merge metadata (includes system info + camera info from collect_metadata.py)
     if args.metadata and os.path.exists(args.metadata):
         with open(args.metadata) as f:
             stats["metadata"] = json.load(f)
+        camera_info = stats["metadata"].get("camera", {})
+        if camera_info.get("detected"):
+            venc = camera_info.get("venc_config_ch0") or {}
+            if venc.get("pic_width"):
+                profile_map = {0: "Baseline", 1: "Main", 2: "High"}
+                encode_map = {1: "H.264", 2: "H.265"}
+                rc_map = {0: "VBR", 1: "CBR"}
+                print(f"  Camera: {camera_info.get('type', 'Unknown')} - "
+                      f"{encode_map.get(venc.get('encode_type'), '?')} "
+                      f"{venc.get('pic_width')}x{venc.get('pic_height')} "
+                      f"@{venc.get('frame_rate')}fps "
+                      f"GOP={venc.get('gop')} "
+                      f"BR={venc.get('bitrate')}kbps "
+                      f"{profile_map.get(venc.get('encode_profile'), '?')} "
+                      f"{rc_map.get(venc.get('rc_mode'), '?')}")
 
     print("  Generating plots...")
     generate_plots(frames, stats, out_dir)
@@ -412,6 +605,7 @@ def main():
     save_frame_log(frames, os.path.join(out_dir, "frame_log.jsonl"))
 
     # Print summary
+    sm = stats.get("system_metrics", {})
     print()
     print("  " + "=" * 60)
     print("  NETWORK-LEVEL FRAME DELIVERY STATISTICS")
@@ -435,6 +629,13 @@ def main():
     if "regression_slope_ms_per_kb" in stats:
         print(f"  Delivery regression: {stats['regression_slope_ms_per_kb']:.3f} ms/KB "
               f"+ {stats['regression_intercept_ms']:.1f}ms")
+    if bw:
+        print(f"  RTP bandwidth:      {bw.get('rtp_bandwidth_mbps', 0)} Mbps  "
+              f"({bw.get('rtp_packet_rate_pps', 0)} pps)")
+    if sm.get("cpu_usage_pct") is not None:
+        print(f"  Host CPU usage:     {sm['cpu_usage_pct']}%")
+    if sm.get("net_rx_mbps") is not None:
+        print(f"  Interface RX:       {sm['net_rx_mbps']} Mbps (total)")
     print("  " + "=" * 60)
 
 

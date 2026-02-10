@@ -56,17 +56,12 @@ echo "[2/6] Output directory: ${RUN_DIR}"
 PCAP_FILE="${RUN_DIR}/capture.pcap"
 CSV_FILE="${RUN_DIR}/rtp_packets.csv"
 
-# Save run metadata
-cat > "${RUN_DIR}/metadata.json" <<METAEOF
-{
-    "rtsp_url": "${RTSP_URL}",
-    "camera_ip": "${CAMERA_IP}",
-    "capture_duration_s": ${CAPTURE_DURATION},
-    "network_interface": "${NETWORK_INTERFACE}",
-    "timestamp": "${TIMESTAMP}",
-    "hostname": "$(hostname)"
-}
-METAEOF
+# ---------------------------------------------------------------------------
+# Collect system + camera metadata (Python handles JSON safely)
+# ---------------------------------------------------------------------------
+echo "[2.5/6] Collecting system and camera metadata..."
+python3 /app/collect_metadata.py \
+    "${CAMERA_IP}" "${CAPTURE_DURATION}" "${NETWORK_INTERFACE}" "${TIMESTAMP}" "${RUN_DIR}"
 
 # ---------------------------------------------------------------------------
 # Start packet capture
@@ -109,10 +104,54 @@ fi
 echo "       RTSP client connected (PID ${GST_PID})"
 
 # ---------------------------------------------------------------------------
-# Capture for the configured duration
+# Snapshot helper: reads /proc counters into a file
 # ---------------------------------------------------------------------------
-echo "       Capturing for ${CAPTURE_DURATION}s..."
+snapshot_system() {
+    local OUT="$1"
+    {
+        echo "--- timestamp ---"
+        date +%s.%N
+        echo "--- /proc/stat ---"
+        head -1 /proc/stat          # cpu aggregate line
+        echo "--- /proc/meminfo ---"
+        grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo
+        echo "--- /proc/net/dev ${NETWORK_INTERFACE} ---"
+        grep "${NETWORK_INTERFACE}" /proc/net/dev
+        echo "--- loadavg ---"
+        cat /proc/loadavg
+    } > "${OUT}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Capture for the configured duration, with system monitoring
+# ---------------------------------------------------------------------------
+SYSMON_DIR="${RUN_DIR}/sysmon"
+mkdir -p "${SYSMON_DIR}"
+
+echo "       Capturing for ${CAPTURE_DURATION}s (with system monitoring)..."
+
+# Snapshot at capture start
+snapshot_system "${SYSMON_DIR}/start.txt"
+
+# Background monitor: sample every 2 seconds
+(
+    i=0
+    while true; do
+        snapshot_system "${SYSMON_DIR}/sample_$(printf '%04d' $i).txt"
+        i=$((i + 1))
+        sleep 2
+    done
+) &
+MONITOR_PID=$!
+
 sleep "${CAPTURE_DURATION}"
+
+# Stop monitor
+kill "${MONITOR_PID}" 2>/dev/null || true
+wait "${MONITOR_PID}" 2>/dev/null || true
+
+# Snapshot at capture end
+snapshot_system "${SYSMON_DIR}/end.txt"
 
 echo "       Stopping capture..."
 kill "${GST_PID}" 2>/dev/null || true
@@ -170,7 +209,8 @@ echo "[6/6] Analyzing packets and generating report..."
 
 python3 /app/analyze.py "${CSV_FILE}" \
     --output-dir "${RUN_DIR}" \
-    --metadata "${RUN_DIR}/metadata.json"
+    --metadata "${RUN_DIR}/metadata.json" \
+    --sysmon-dir "${SYSMON_DIR}" \
 
 python3 /app/report.py "${RUN_DIR}"
 
